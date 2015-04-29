@@ -61,6 +61,7 @@ typedef struct {
     unsigned long long last_update_clock_usec;
 
     bool is_new_cpupool;
+    bool new_dom_join;
 } cpupool_info;
 
 typedef struct {
@@ -96,6 +97,7 @@ void init_cpupool(cpupool_info &cpupool)
     cpupool.hotplug_doms_rank.clear();
     cpupool.last_update_clock_usec = 0U;
     cpupool.is_new_cpupool = true;
+    cpupool.new_dom_join = false;
 }
 
 void init_domain(dom_info &dom)
@@ -179,10 +181,10 @@ void get_cpupool_domains(cpupool_info &pool)
 
     float pool_running_time = 0.0;
     unsigned int pool_total_weight = 0U;
+    bool new_dom_join = false;
 
     while (fgets(line, sizeof(line), pipe) != NULL) 
     {
-        num_doms++;
         // printf("%s\n", line);
         dom_info dom;
         init_domain(dom);
@@ -196,7 +198,7 @@ void get_cpupool_domains(cpupool_info &pool)
                 &dom.cur_rt.runnable_time, 
                 &dom.cur_rt.blocked_time, 
                 &dom.cur_rt.offline_time);
-        /*
+/* 
         printf("%s %u %u %u %u %u %lf %f %f %f\n",
                 dom_name, 
                 dom.dom_id, 
@@ -207,7 +209,7 @@ void get_cpupool_domains(cpupool_info &pool)
                 dom.cur_rt.runnable_time, 
                 dom.cur_rt.blocked_time, 
                 dom.cur_rt.offline_time);
-        */
+*/
 
         if (pool.all_doms.find(dom.dom_id) != pool.all_doms.end())
         {
@@ -228,6 +230,12 @@ void get_cpupool_domains(cpupool_info &pool)
         }
         else /* A new domain joins. */
         {
+            /* Important: the domain just boots up */
+            if (dom.max_vcpus == 0)
+            {
+                new_dom_join = true;
+                continue;
+            }
             dom.last_update_clock_usec = global_update_clock_usec;
 
             pool.all_doms.insert({dom.dom_id, dom});
@@ -243,12 +251,14 @@ void get_cpupool_domains(cpupool_info &pool)
             }
         }
 
+        num_doms++;
         pool_running_time += dom.cur_rt.running_time;
         pool_total_weight += dom.weight;
     }
     pool.num_doms = num_doms;
     pool.cur_running_time = pool_running_time;
     pool.total_weight = pool_total_weight;
+    pool.new_dom_join = new_dom_join;
 
     pclose(pipe);
 }
@@ -280,7 +290,7 @@ void check_all_domains(vbal_manager &vbal)
         // see whether the cpupool has been fully utilized
         // If YES - nothing to to; 
         // If NO - we may add more vCPUs (if possible);
-        if ( !pool->is_new_cpupool )
+        if ( !pool->is_new_cpupool && !pool->new_dom_join)
         {
             float pool_running_time = pool->cur_running_time - pool->prev_running_time;
             float pool_allocated_time = pool->num_cpus * UPDATE_INTERVAL_SEC;
