@@ -12,10 +12,10 @@
 using namespace std;
 
 typedef struct {
-    double running_time;
-    double runnnable_time;
-    double blocked_time;
-    double offline_time;
+    float running_time;
+    float runnable_time;
+    float blocked_time;
+    float offline_time;
 } runtime_info;
 
 typedef struct {
@@ -90,10 +90,10 @@ void get_all_cpupools(vbal_manager &vbal)
     vbal.num_cpupools = num_cpupools;
 }
 
-void get_cpupool_domains(cpupool_info &cpupool)
+void get_cpupool_domains(cpupool_info &pool)
 {
     string cmd("/usr/local/sbin/xl sched-credit-cpupool -p ");
-    string cmd_p = cmd + cpupool.name;
+    string cmd_p = cmd + pool.name;
     char line[256];
     int num_doms = 0;
 
@@ -103,21 +103,54 @@ void get_cpupool_domains(cpupool_info &cpupool)
     fgets(line, sizeof(line), pipe);
 
     char dom_name[256];
-    int dom_id;
-    int weight, cap;
-    int max_vcpus, online_vcpus;
-    double running_time, runnable_time, blocked_time, offline_time;
 
-    while (fgets(line, sizeof(line), pipe) != NULL)
+    while (fgets(line, sizeof(line), pipe) != NULL) 
     {
         num_doms++;
-        // printf("line = %s\n", line);
-        sscanf(line, "%s %d %d %d %d %d %lf %lf %lf %lf",
-                dom_name, &dom_id, &weight, &cap, &max_vcpus, &online_vcpus,
-                &running_time, &runnable_time, &blocked_time, &offline_time);
-        // printf("%s %d %d %d %d %d %lf %lf %lf %lf\n",
-        //        dom_name, dom_id, weight, cap, max_vcpus, online_vcpus,
-        //        running_time, runnable_time, blocked_time, offline_time);
+        // printf("%s\n", line);
+        dom_info dom;
+        sscanf(line, "%s %d %d %d %d %d %f %f %f %f",
+                dom_name, 
+                &dom.dom_id,
+                &dom.weight, &dom.cap, 
+                &dom.max_vcpus, &dom.online_vcpus,
+                &dom.cur.running_time, 
+                &dom.cur.runnable_time, 
+                &dom.cur.blocked_time, 
+                &dom.cur.offline_time);
+        /*
+        printf("%s %d %d %d %d %d %lf %f %f %f\n",
+                dom_name, 
+                dom.dom_id, 
+                dom.weight, dom.cap, 
+                dom.max_vcpus, dom.online_vcpus,
+                dom.cur.running_time, 
+                dom.cur.runnable_time, 
+                dom.cur.blocked_time, 
+                dom.cur.offline_time);
+        */
+
+        if (pool.all_doms.find(dom.dom_id) != pool.all_doms.end())
+        {
+            dom_info *orig_dom = &pool.all_doms[dom.dom_id];
+            orig_dom->dom_id = dom.dom_id;
+            orig_dom->weight = dom.weight;
+            orig_dom->cap = dom.cap;
+            orig_dom->max_vcpus = dom.max_vcpus;
+            orig_dom->online_vcpus = dom.online_vcpus;
+            orig_dom->cur.running_time = dom.cur.running_time;
+            orig_dom->cur.runnable_time = dom.cur.runnable_time;
+            orig_dom->cur.blocked_time = dom.cur.blocked_time;
+            orig_dom->cur.offline_time = dom.cur.offline_time;
+        } 
+        else 
+        {
+            dom.prev.running_time = 0.0;
+            dom.prev.runnable_time = 0.0;
+            dom.prev.blocked_time = 0.0;
+            dom.prev.offline_time = 0.0;
+            pool.all_doms.insert({dom.dom_id, dom});
+        }
     }
     
     pclose(pipe);
@@ -134,9 +167,28 @@ void get_all_domains(vbal_manager &vbal)
 void print_manager(vbal_manager &vbal)
 {
     printf("# of cpupools: %d\n", vbal.num_cpupools);
-    for (auto iter = vbal.all_cpupools.begin(); iter != vbal.all_cpupools.end(); iter++)
+    for (auto pool_iter = vbal.all_cpupools.begin();
+              pool_iter != vbal.all_cpupools.end(); 
+              pool_iter++)
     {
-        printf("%s: %d CPUs\n", iter->first.c_str(), iter->second.num_cpus);
+        cpupool_info *pool = &pool_iter->second;
+        printf("CPUPool: %s: %d CPUs\n", pool_iter->first.c_str(), pool->num_cpus);
+
+        for (auto dom_iter = pool->all_doms.begin(); 
+                  dom_iter != pool->all_doms.end(); 
+                  dom_iter++)
+        {
+            dom_info *dom = &dom_iter->second;
+            printf("dom %d: w:%d c:%d max:%d online:%d r:%.2f/%.2f w:%.2f/%.2f b:%.2f/%.2f o:%.2f/%.2f\n",
+                    dom->dom_id,
+                    dom->weight, dom->cap,
+                    dom->max_vcpus, dom->online_vcpus,
+                    dom->cur.running_time, dom->prev.running_time,
+                    dom->cur.runnable_time, dom->prev.runnable_time,
+                    dom->cur.blocked_time, dom->prev.blocked_time,
+                    dom->cur.offline_time, dom->prev.offline_time
+                   );
+        }
     }
 }
 
@@ -145,7 +197,7 @@ int main(int argc, char* argv[])
     init_manager(global_manager);
     get_all_cpupools(global_manager);
     get_all_domains(global_manager);
-    //print_manager(global_manager);
+    print_manager(global_manager);
 
     return 0;
 }
