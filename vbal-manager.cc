@@ -30,7 +30,7 @@ typedef struct {
     runtime_info prev;
     runtime_info cur;
 
-    struct timeval last_check;
+    long long last_update_clock_usec;
 } dom_info;
 
 
@@ -40,6 +40,8 @@ typedef struct {
     int num_doms;
     int total_weight;
     unordered_map<int, dom_info> all_doms;
+
+    long long last_update_clock_usec;
 } cpupool_info;
 
 typedef struct {
@@ -48,6 +50,7 @@ typedef struct {
 } vbal_manager;
 
 vbal_manager global_manager;
+long long global_update_clock_usec;
 
 void init_manager(vbal_manager &vbal)
 {
@@ -76,13 +79,17 @@ void get_all_cpupools(vbal_manager &vbal)
         string pool_name(cpupool_name);
         if (vbal.all_cpupools.find(cpupool_name) != vbal.all_cpupools.end())
         {
-            vbal.all_cpupools[cpupool_name].num_cpus = num_cpus;
+            cpupool_info *orig_pool = &vbal.all_cpupools[cpupool_name];
+
+            orig_pool->num_cpus = num_cpus;
+            orig_pool->last_update_clock_usec = global_update_clock_usec;
         }
         else
         {
             cpupool_info new_cpupool;
             new_cpupool.num_cpus = num_cpus;
             new_cpupool.name = pool_name;
+            new_cpupool.last_update_clock_usec = global_update_clock_usec;
             vbal.all_cpupools.insert({pool_name, new_cpupool});
         }
     }
@@ -133,6 +140,7 @@ void get_cpupool_domains(cpupool_info &pool)
         if (pool.all_doms.find(dom.dom_id) != pool.all_doms.end())
         {
             dom_info *orig_dom = &pool.all_doms[dom.dom_id];
+
             orig_dom->dom_id = dom.dom_id;
             orig_dom->weight = dom.weight;
             orig_dom->cap = dom.cap;
@@ -142,25 +150,68 @@ void get_cpupool_domains(cpupool_info &pool)
             orig_dom->cur.runnable_time = dom.cur.runnable_time;
             orig_dom->cur.blocked_time = dom.cur.blocked_time;
             orig_dom->cur.offline_time = dom.cur.offline_time;
-        } 
+
+            orig_dom->last_update_clock_usec = global_update_clock_usec;
+        }
         else 
         {
             dom.prev.running_time = 0.0;
             dom.prev.runnable_time = 0.0;
             dom.prev.blocked_time = 0.0;
             dom.prev.offline_time = 0.0;
+
+            dom.last_update_clock_usec = global_update_clock_usec;
+
             pool.all_doms.insert({dom.dom_id, dom});
         }
     }
-    
+    pool.num_doms = num_doms;
+
     pclose(pipe);
 }
 
 void get_all_domains(vbal_manager &vbal)
 {
-    for (auto iter = vbal.all_cpupools.begin(); iter != vbal.all_cpupools.end(); iter++)
+    for (auto pool_iter = vbal.all_cpupools.begin(); 
+              pool_iter != vbal.all_cpupools.end(); 
+              pool_iter++)
     {
-        get_cpupool_domains(iter->second);
+        get_cpupool_domains(pool_iter->second);
+    }
+}
+
+void check_all_domains(vbal_manager &vbal)
+{
+    for (auto pool_iter = vbal.all_cpupools.begin(); 
+              pool_iter != vbal.all_cpupools.end(); )
+    {
+        cpupool_info *pool = &pool_iter->second;
+        if (pool->last_update_clock_usec < global_update_clock_usec)
+        {
+            pool_iter = vbal.all_cpupools.erase(pool_iter);
+            continue;
+        }
+
+        for (auto dom_iter = pool->all_doms.begin();
+                  dom_iter != pool->all_doms.end(); )
+        {
+            dom_info *dom = &dom_iter->second;
+            if (dom->last_update_clock_usec < global_update_clock_usec)
+            {
+                dom_iter = pool->all_doms.erase(dom_iter);
+                continue;
+            }
+
+            // check steal_time here.
+            dom->prev.running_time = dom->cur.running_time;
+            dom->prev.runnable_time = dom->cur.runnable_time;
+            dom->prev.blocked_time = dom->cur.blocked_time;
+            dom->prev.offline_time = dom->cur.offline_time;
+
+            dom_iter++;
+        }
+
+        pool_iter++;
     }
 }
 
@@ -172,14 +223,17 @@ void print_manager(vbal_manager &vbal)
               pool_iter++)
     {
         cpupool_info *pool = &pool_iter->second;
-        printf("CPUPool: %s: %d CPUs\n", pool_iter->first.c_str(), pool->num_cpus);
+        printf("[%lld] = CPUPool = %15s: %d CPUs, %d domain(s).\n", 
+                pool->last_update_clock_usec, pool_iter->first.c_str(),
+                pool->num_cpus, pool->num_doms);
 
         for (auto dom_iter = pool->all_doms.begin(); 
                   dom_iter != pool->all_doms.end(); 
                   dom_iter++)
         {
             dom_info *dom = &dom_iter->second;
-            printf("dom %d: w:%d c:%d max:%d online:%d r:%.2f/%.2f w:%.2f/%.2f b:%.2f/%.2f o:%.2f/%.2f\n",
+            printf("[%lld] dom %d: <w:%d c:%d> <max:%d online:%d> <r:%.2f/%.2f w:%.2f/%.2f b:%.2f/%.2f o:%.2f/%.2f>\n",
+                    dom->last_update_clock_usec,
                     dom->dom_id,
                     dom->weight, dom->cap,
                     dom->max_vcpus, dom->online_vcpus,
@@ -192,12 +246,26 @@ void print_manager(vbal_manager &vbal)
     }
 }
 
+#define USEC_PER_SEC 1000000U
+#define UPDATE_INTERVAL_SEC 5
+
 int main(int argc, char* argv[])
 {
     init_manager(global_manager);
-    get_all_cpupools(global_manager);
-    get_all_domains(global_manager);
-    print_manager(global_manager);
+
+    while (1)
+    {
+        struct timeval timestamp;
+        gettimeofday(&timestamp, NULL);
+        global_update_clock_usec = timestamp.tv_sec * 1000000 + timestamp.tv_usec;
+        get_all_cpupools(global_manager);
+        get_all_domains(global_manager);
+
+        print_manager(global_manager);
+
+        check_all_domains(global_manager);
+        usleep(UPDATE_INTERVAL_SEC * USEC_PER_SEC);
+    }
 
     return 0;
 }
