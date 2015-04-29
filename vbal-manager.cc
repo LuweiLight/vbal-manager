@@ -1,4 +1,5 @@
 #include <unordered_set>
+#include <map>
 #include <unordered_map>
 #include <vector>
 #include <string>
@@ -6,6 +7,9 @@
 #include <iostream>
 #include <stdio.h>
 #include <unistd.h>
+#include <assert.h>
+#include <math.h>
+#include <limits.h>
 #include <sys/types.h>
 #include <sys/time.h>
 
@@ -19,43 +23,97 @@ typedef struct {
 } runtime_info;
 
 typedef struct {
-    int dom_id;
+    unsigned int dom_id;
 
-    int weight;
-    int cap;
+    unsigned int weight;
+    unsigned int cap;
 
-    int max_vcpus;
-    int online_vcpus;
+    unsigned int max_vcpus;
+    unsigned int online_vcpus;
 
-    runtime_info prev;
-    runtime_info cur;
+    runtime_info prev_rt;
+    runtime_info cur_rt;
 
-    long long last_update_clock_usec;
+    unsigned long long last_update_clock_usec;
+
+    bool is_new_dom;
 } dom_info;
 
 
 typedef struct {
     string name;
-    int num_cpus;
-    int num_doms;
-    int total_weight;
-    unordered_map<int, dom_info> all_doms;
+    unsigned int num_cpus;
+    unsigned int num_doms;
 
-    long long last_update_clock_usec;
+    unsigned int total_weight;
+
+    float prev_running_time;
+    float cur_running_time;
+
+    // dom_id -> dom_info
+    unordered_map<unsigned int, dom_info> all_doms;
+
+    // # of offline_vcpus -> dom_id; order >
+    multimap<unsigned int, unsigned int, greater<unsigned int>> hotplug_doms;
+
+    unsigned long long last_update_clock_usec;
+
+    bool is_new_cpupool;
 } cpupool_info;
 
 typedef struct {
-    int num_cpupools;
+    unsigned int num_cpupools;
     unordered_map<string, cpupool_info> all_cpupools;
 } vbal_manager;
 
+/* 
+ * Global variables etc. 
+ */
 vbal_manager global_manager;
-long long global_update_clock_usec;
+unsigned long long global_update_clock_usec;
+#define USEC_PER_SEC        1000000U
+#define UPDATE_INTERVAL_SEC 5
 
 void init_manager(vbal_manager &vbal)
 {
     global_manager.num_cpupools = 0;
     global_manager.all_cpupools.clear();
+}
+
+void init_cpupool(cpupool_info &cpupool)
+{
+    cpupool.name.clear();
+    cpupool.num_doms = 0U;
+    cpupool.total_weight = 0U;
+
+    cpupool.prev_running_time = 0.0;
+    cpupool.cur_running_time = 0.0;
+
+    cpupool.all_doms.clear();
+    cpupool.hotplug_doms.clear();
+    cpupool.last_update_clock_usec = 0U;
+    cpupool.is_new_cpupool = true;
+}
+
+void init_domain(dom_info &dom)
+{
+    dom.dom_id = INT_MAX;
+    dom.weight = 0U;
+    dom.cap = 0U;
+    dom.max_vcpus = 0U;
+    dom.online_vcpus = 0U;
+
+    dom.prev_rt.running_time = 0.0;
+    dom.prev_rt.runnable_time = 0.0;
+    dom.prev_rt.blocked_time = 0.0;
+    dom.prev_rt.offline_time = 0.0;
+    dom.cur_rt.running_time = 0.0;
+    dom.cur_rt.runnable_time = 0.0;
+    dom.cur_rt.blocked_time = 0.0;
+    dom.cur_rt.offline_time = 0.0;
+
+    dom.last_update_clock_usec = 0U;
+    dom.is_new_dom = true;
 }
 
 void get_all_cpupools(vbal_manager &vbal)
@@ -66,14 +124,14 @@ void get_all_cpupools(vbal_manager &vbal)
     char line[256];
     fgets(line, sizeof(line), pipe); // headline, ignore;
 
-    int num_cpupools = 0;
+    unsigned int num_cpupools = 0;
     while (fgets(line, sizeof(line), pipe) != NULL) 
     {
         num_cpupools++;
 
         char cpupool_name[256];
-        int num_cpus;
-        sscanf(line, "%s %d", cpupool_name, &num_cpus);
+        unsigned int num_cpus;
+        sscanf(line, "%s %u", cpupool_name, &num_cpus);
         // printf("%s, %d\n", cpupool_name, num_cpus);
 
         string pool_name(cpupool_name);
@@ -83,13 +141,17 @@ void get_all_cpupools(vbal_manager &vbal)
 
             orig_pool->num_cpus = num_cpus;
             orig_pool->last_update_clock_usec = global_update_clock_usec;
+            orig_pool->is_new_cpupool = false;
         }
-        else
+        else /* A new cpupool joins. */
         {
             cpupool_info new_cpupool;
+            init_cpupool(new_cpupool);
+
             new_cpupool.num_cpus = num_cpus;
             new_cpupool.name = pool_name;
             new_cpupool.last_update_clock_usec = global_update_clock_usec;
+
             vbal.all_cpupools.insert({pool_name, new_cpupool});
         }
     }
@@ -102,7 +164,7 @@ void get_cpupool_domains(cpupool_info &pool)
     string cmd("/usr/local/sbin/xl sched-credit-cpupool -p ");
     string cmd_p = cmd + pool.name;
     char line[256];
-    int num_doms = 0;
+    unsigned int num_doms = 0U;
 
     FILE *pipe = popen(cmd_p.c_str(), "r");
 
@@ -111,61 +173,76 @@ void get_cpupool_domains(cpupool_info &pool)
 
     char dom_name[256];
 
+    float pool_running_time = 0.0;
+    unsigned int pool_total_weight = 0U;
+
     while (fgets(line, sizeof(line), pipe) != NULL) 
     {
         num_doms++;
         // printf("%s\n", line);
         dom_info dom;
-        sscanf(line, "%s %d %d %d %d %d %f %f %f %f",
+        init_domain(dom);
+
+        sscanf(line, "%s %u %u %u %u %u %f %f %f %f",
                 dom_name, 
                 &dom.dom_id,
                 &dom.weight, &dom.cap, 
                 &dom.max_vcpus, &dom.online_vcpus,
-                &dom.cur.running_time, 
-                &dom.cur.runnable_time, 
-                &dom.cur.blocked_time, 
-                &dom.cur.offline_time);
-        /*
-        printf("%s %d %d %d %d %d %lf %f %f %f\n",
+                &dom.cur_rt.running_time, 
+                &dom.cur_rt.runnable_time, 
+                &dom.cur_rt.blocked_time, 
+                &dom.cur_rt.offline_time);
+        
+        printf("%s %u %u %u %u %u %lf %f %f %f\n",
                 dom_name, 
                 dom.dom_id, 
                 dom.weight, dom.cap, 
-                dom.max_vcpus, dom.online_vcpus,
-                dom.cur.running_time, 
-                dom.cur.runnable_time, 
-                dom.cur.blocked_time, 
-                dom.cur.offline_time);
-        */
+                dom.max_vcpus, 
+                dom.online_vcpus,
+                dom.cur_rt.running_time, 
+                dom.cur_rt.runnable_time, 
+                dom.cur_rt.blocked_time, 
+                dom.cur_rt.offline_time);
+        
 
         if (pool.all_doms.find(dom.dom_id) != pool.all_doms.end())
         {
             dom_info *orig_dom = &pool.all_doms[dom.dom_id];
 
             orig_dom->dom_id = dom.dom_id;
+
             orig_dom->weight = dom.weight;
             orig_dom->cap = dom.cap;
-            orig_dom->max_vcpus = dom.max_vcpus;
-            orig_dom->online_vcpus = dom.online_vcpus;
-            orig_dom->cur.running_time = dom.cur.running_time;
-            orig_dom->cur.runnable_time = dom.cur.runnable_time;
-            orig_dom->cur.blocked_time = dom.cur.blocked_time;
-            orig_dom->cur.offline_time = dom.cur.offline_time;
+
+            orig_dom->cur_rt.running_time = dom.cur_rt.running_time;
+            orig_dom->cur_rt.runnable_time = dom.cur_rt.runnable_time;
+            orig_dom->cur_rt.blocked_time = dom.cur_rt.blocked_time;
+            orig_dom->cur_rt.offline_time = dom.cur_rt.offline_time;
 
             orig_dom->last_update_clock_usec = global_update_clock_usec;
+            orig_dom->is_new_dom = false;
         }
-        else 
+        else /* A new domain joins. */
         {
-            dom.prev.running_time = 0.0;
-            dom.prev.runnable_time = 0.0;
-            dom.prev.blocked_time = 0.0;
-            dom.prev.offline_time = 0.0;
-
             dom.last_update_clock_usec = global_update_clock_usec;
 
             pool.all_doms.insert({dom.dom_id, dom});
+
+            printf("New domain: dom %u, max:%u, online:%u\n",
+                    dom.dom_id, dom.max_vcpus, dom.online_vcpus);
+
+            unsigned int offline_vcpus = dom.max_vcpus - dom.online_vcpus;
+            if ( offline_vcpus != 0U)
+            {
+                pool.hotplug_doms.insert({offline_vcpus, dom.dom_id});
+            }
         }
+
+        pool_running_time += dom.cur_rt.running_time;
     }
     pool.num_doms = num_doms;
+    pool.cur_running_time = pool_running_time;
+    pool.total_weight = pool_total_weight;
 
     pclose(pipe);
 }
@@ -186,27 +263,110 @@ void check_all_domains(vbal_manager &vbal)
               pool_iter != vbal.all_cpupools.end(); )
     {
         cpupool_info *pool = &pool_iter->second;
+
+        // This cpupool disappears.
         if (pool->last_update_clock_usec < global_update_clock_usec)
         {
             pool_iter = vbal.all_cpupools.erase(pool_iter);
             continue;
         }
 
+        // see whether the cpupool has been fully utilized
+        // If YES - nothing to to; 
+        // If NO - we may add more vCPUs (if possible);
+        if ( !pool->is_new_cpupool )
+        {
+            float pool_running_time = pool->cur_running_time - pool->prev_running_time;
+            float pool_allocated_time = pool->num_cpus * UPDATE_INTERVAL_SEC;
+            float pool_idle_time = fabs(pool_allocated_time - pool_running_time) * 1.05;
+            unsigned int num_idle_cpus = (unsigned int)(pool_idle_time / UPDATE_INTERVAL_SEC);
+
+            printf("-cpupool %s, idle_time = %.2f, idle_cpus = %u\n", 
+                    pool->name.c_str(), pool_idle_time, num_idle_cpus);
+
+            for (unsigned int i = 0; i < num_idle_cpus; i++)
+            {
+                // Try to add one vCPU at a time
+                if ( !pool->hotplug_doms.empty() )
+                {
+                    auto iter = pool->hotplug_doms.begin();
+                    unsigned int dom_id = iter->first;
+                    dom_info *dom = &pool->all_doms[dom_id];
+
+                    printf("hotplug: dom %u, online: %u max: %u", 
+                            dom->dom_id, dom->online_vcpus, dom->max_vcpus);
+
+                    assert(dom->online_vcpus < dom->max_vcpus);
+                    dom->online_vcpus++;
+                    if (dom->online_vcpus == dom->max_vcpus)
+                    {
+                        pool->hotplug_doms.erase(iter);
+                    }
+
+                    string cmd("/usr/local/sbin/xl vcpu-set ");
+                    cmd += to_string((long long)dom->dom_id);
+                    cmd += " ";
+                    cmd += to_string((long long)dom->online_vcpus);
+
+                    printf("exec: %s\n", cmd.c_str());
+                    system(cmd.c_str());
+                }
+                else
+                {
+                    break;
+                }
+            }
+        }
+
+        pool->prev_running_time = pool->cur_running_time;
+
+
         for (auto dom_iter = pool->all_doms.begin();
                   dom_iter != pool->all_doms.end(); )
         {
             dom_info *dom = &dom_iter->second;
+
+            // This domain disappears.
             if (dom->last_update_clock_usec < global_update_clock_usec)
             {
                 dom_iter = pool->all_doms.erase(dom_iter);
                 continue;
             }
 
-            // check steal_time here.
-            dom->prev.running_time = dom->cur.running_time;
-            dom->prev.runnable_time = dom->cur.runnable_time;
-            dom->prev.blocked_time = dom->cur.blocked_time;
-            dom->prev.offline_time = dom->cur.offline_time;
+            // check steal_time here, ignore dom0 here.
+            if ( !pool->is_new_cpupool && dom->dom_id != 0U && !dom->is_new_dom )
+            {
+                float dom_steal_time = (dom->cur_rt.runnable_time + dom->cur_rt.offline_time) -
+                                       (dom->prev_rt.runnable_time + dom->prev_rt.offline_time);
+                unsigned int offline_vcpus = (unsigned int)(dom_steal_time * 1.05 / UPDATE_INTERVAL_SEC);
+                
+                printf("dom %u, steal_time = %.2f, max_vcpus = %u, online_vcpus = %u, offline_vcpus = %u\n",
+                        dom->dom_id, dom_steal_time, dom->max_vcpus, dom->online_vcpus, offline_vcpus);
+
+                if ( offline_vcpus > (dom->max_vcpus - dom->online_vcpus) )
+                {
+                    dom->online_vcpus = dom->max_vcpus - offline_vcpus;
+                    pool->hotplug_doms.insert({offline_vcpus, dom->dom_id});
+
+                    string cmd("/usr/local/sbin/xl vcpu-set ");
+                    cmd += to_string((long long)dom->dom_id);
+                    cmd += " ";
+                    cmd += to_string((long long)dom->online_vcpus);
+
+                    printf("exec: %s\n", cmd.c_str());
+                    system(cmd.c_str());
+                }
+                else if ( offline_vcpus < (dom->max_vcpus - dom->online_vcpus) )
+                {
+                    printf("Error: dom %u, steal_time = %.2f, max_vcpus = %u, online_vcpus = %u\n", 
+                           dom->dom_id, dom_steal_time, dom->max_vcpus, dom->online_vcpus);
+                }
+            }
+
+            dom->prev_rt.running_time = dom->cur_rt.running_time;
+            dom->prev_rt.runnable_time = dom->cur_rt.runnable_time;
+            dom->prev_rt.blocked_time = dom->cur_rt.blocked_time;
+            dom->prev_rt.offline_time = dom->cur_rt.offline_time;
 
             dom_iter++;
         }
@@ -217,37 +377,38 @@ void check_all_domains(vbal_manager &vbal)
 
 void print_manager(vbal_manager &vbal)
 {
-    printf("# of cpupools: %d\n", vbal.num_cpupools);
+    printf("# of cpupools: %u\n", vbal.num_cpupools);
     for (auto pool_iter = vbal.all_cpupools.begin();
               pool_iter != vbal.all_cpupools.end(); 
               pool_iter++)
     {
         cpupool_info *pool = &pool_iter->second;
-        printf("[%lld] = CPUPool = %15s: %d CPUs, %d domain(s).\n", 
+        printf("[%llu] = CPUPool = %15s: %u CPUs, %u dom(s) <r:%.2f/%.2f>.\n", 
                 pool->last_update_clock_usec, pool_iter->first.c_str(),
-                pool->num_cpus, pool->num_doms);
+                pool->num_cpus, pool->num_doms,
+                pool->cur_running_time, 
+                pool->prev_running_time
+              );
 
         for (auto dom_iter = pool->all_doms.begin(); 
                   dom_iter != pool->all_doms.end(); 
                   dom_iter++)
         {
             dom_info *dom = &dom_iter->second;
-            printf("[%lld] dom %d: <w:%d c:%d> <max:%d online:%d> <r:%.2f/%.2f w:%.2f/%.2f b:%.2f/%.2f o:%.2f/%.2f>\n",
+            printf("[%llu] dom %u: <w:%u c:%u> <max:%u online:%u> <r:%.2f/%.2f w:%.2f/%.2f b:%.2f/%.2f o:%.2f/%.2f>\n",
                     dom->last_update_clock_usec,
                     dom->dom_id,
                     dom->weight, dom->cap,
                     dom->max_vcpus, dom->online_vcpus,
-                    dom->cur.running_time, dom->prev.running_time,
-                    dom->cur.runnable_time, dom->prev.runnable_time,
-                    dom->cur.blocked_time, dom->prev.blocked_time,
-                    dom->cur.offline_time, dom->prev.offline_time
+                    dom->cur_rt.running_time, dom->prev_rt.running_time,
+                    dom->cur_rt.runnable_time, dom->prev_rt.runnable_time,
+                    dom->cur_rt.blocked_time, dom->prev_rt.blocked_time,
+                    dom->cur_rt.offline_time, dom->prev_rt.offline_time
                    );
         }
     }
 }
 
-#define USEC_PER_SEC 1000000U
-#define UPDATE_INTERVAL_SEC 5
 
 int main(int argc, char* argv[])
 {
@@ -266,6 +427,8 @@ int main(int argc, char* argv[])
         check_all_domains(global_manager);
         usleep(UPDATE_INTERVAL_SEC * USEC_PER_SEC);
     }
+
+    // system("/usr/local/sbin/xl vcpu-set 1 2");
 
     return 0;
 }
