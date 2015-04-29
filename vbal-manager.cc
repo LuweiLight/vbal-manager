@@ -35,6 +35,7 @@ typedef struct {
     runtime_info cur_rt;
 
     unsigned long long last_update_clock_usec;
+    unsigned long long last_hotplug_clock_usec;
 
     bool is_new_dom;
 } dom_info;
@@ -54,7 +55,8 @@ typedef struct {
     unordered_map<unsigned int, dom_info> all_doms;
 
     // # of offline_vcpus -> dom_id; order >
-    multimap<unsigned int, unsigned int, greater<unsigned int>> hotplug_doms;
+    unordered_set<unsigned int> hotplug_doms_set;
+    multimap<unsigned int, unsigned int, greater<unsigned int>> hotplug_doms_rank;
 
     unsigned long long last_update_clock_usec;
 
@@ -90,7 +92,8 @@ void init_cpupool(cpupool_info &cpupool)
     cpupool.cur_running_time = 0.0;
 
     cpupool.all_doms.clear();
-    cpupool.hotplug_doms.clear();
+    cpupool.hotplug_doms_set.clear();
+    cpupool.hotplug_doms_rank.clear();
     cpupool.last_update_clock_usec = 0U;
     cpupool.is_new_cpupool = true;
 }
@@ -113,6 +116,7 @@ void init_domain(dom_info &dom)
     dom.cur_rt.offline_time = 0.0;
 
     dom.last_update_clock_usec = 0U;
+    dom.last_hotplug_clock_usec = 0U;
     dom.is_new_dom = true;
 }
 
@@ -192,7 +196,7 @@ void get_cpupool_domains(cpupool_info &pool)
                 &dom.cur_rt.runnable_time, 
                 &dom.cur_rt.blocked_time, 
                 &dom.cur_rt.offline_time);
-        
+        /*
         printf("%s %u %u %u %u %u %lf %f %f %f\n",
                 dom_name, 
                 dom.dom_id, 
@@ -203,7 +207,7 @@ void get_cpupool_domains(cpupool_info &pool)
                 dom.cur_rt.runnable_time, 
                 dom.cur_rt.blocked_time, 
                 dom.cur_rt.offline_time);
-        
+        */
 
         if (pool.all_doms.find(dom.dom_id) != pool.all_doms.end())
         {
@@ -228,17 +232,19 @@ void get_cpupool_domains(cpupool_info &pool)
 
             pool.all_doms.insert({dom.dom_id, dom});
 
-            printf("New domain: dom %u, max:%u, online:%u\n",
-                    dom.dom_id, dom.max_vcpus, dom.online_vcpus);
+            // printf("New domain: dom %u, max:%u, online:%u\n",
+            //        dom.dom_id, dom.max_vcpus, dom.online_vcpus);
 
             unsigned int offline_vcpus = dom.max_vcpus - dom.online_vcpus;
             if ( offline_vcpus != 0U)
             {
-                pool.hotplug_doms.insert({offline_vcpus, dom.dom_id});
+                pool.hotplug_doms_set.insert(dom.dom_id);
+                pool.hotplug_doms_rank.insert({offline_vcpus, dom.dom_id});
             }
         }
 
         pool_running_time += dom.cur_rt.running_time;
+        pool_total_weight += dom.weight;
     }
     pool.num_doms = num_doms;
     pool.cur_running_time = pool_running_time;
@@ -287,21 +293,32 @@ void check_all_domains(vbal_manager &vbal)
             for (unsigned int i = 0; i < num_idle_cpus; i++)
             {
                 // Try to add one vCPU at a time
-                if ( !pool->hotplug_doms.empty() )
+                if ( !pool->hotplug_doms_set.empty() )
                 {
-                    auto iter = pool->hotplug_doms.begin();
-                    unsigned int dom_id = iter->first;
-                    dom_info *dom = &pool->all_doms[dom_id];
+                    /*
+                    for (auto dom_iter = pool->hotplug_doms_rank.begin();
+                              dom_iter != pool->hotplug_doms_rank.end();
+                              dom_iter++)
+                    {
+                        unsigned int dom_id = dom_iter->second;
+                        printf("---offline_vcpus: %u, dom_id = %u, max = %u, online = %u\n",
+                                dom_iter->first, dom_id,
+                                pool->all_doms[dom_id].max_vcpus,
+                                pool->all_doms[dom_id].online_vcpus);
+                    }
+                    */
 
-                    printf("hotplug: dom %u, online: %u max: %u", 
-                            dom->dom_id, dom->online_vcpus, dom->max_vcpus);
+                    auto dom_iter = pool->hotplug_doms_rank.begin();
+                    unsigned int dom_id = dom_iter->second;
+                    pool->hotplug_doms_rank.erase(dom_iter);
+                    pool->hotplug_doms_set.erase(dom_id);
+
+                    dom_info *dom = &pool->all_doms[dom_id];
+                    printf("Add-vCPU: dom %u, max: %u online: %u\n", dom->dom_id, dom->max_vcpus, dom->online_vcpus);
 
                     assert(dom->online_vcpus < dom->max_vcpus);
                     dom->online_vcpus++;
-                    if (dom->online_vcpus == dom->max_vcpus)
-                    {
-                        pool->hotplug_doms.erase(iter);
-                    }
+                    dom->last_hotplug_clock_usec = global_update_clock_usec;
 
                     string cmd("/usr/local/sbin/xl vcpu-set ");
                     cmd += to_string((long long)dom->dom_id);
@@ -310,6 +327,13 @@ void check_all_domains(vbal_manager &vbal)
 
                     printf("exec: %s\n", cmd.c_str());
                     system(cmd.c_str());
+
+                    unsigned int offline_vcpus = dom->max_vcpus - dom->online_vcpus;
+                    if (offline_vcpus != 0U)
+                    {
+                        pool->hotplug_doms_set.insert(dom_id);
+                        pool->hotplug_doms_rank.insert({offline_vcpus, dom_id});
+                    }
                 }
                 else
                 {
@@ -333,8 +357,10 @@ void check_all_domains(vbal_manager &vbal)
                 continue;
             }
 
-            // check steal_time here, ignore dom0 here.
-            if ( !pool->is_new_cpupool && dom->dom_id != 0U && !dom->is_new_dom )
+            if ( !pool->is_new_cpupool && 
+                 dom->dom_id != 0U && 
+                 !dom->is_new_dom &&
+                 dom->last_hotplug_clock_usec < global_update_clock_usec)
             {
                 float dom_steal_time = (dom->cur_rt.runnable_time + dom->cur_rt.offline_time) -
                                        (dom->prev_rt.runnable_time + dom->prev_rt.offline_time);
@@ -346,7 +372,8 @@ void check_all_domains(vbal_manager &vbal)
                 if ( offline_vcpus > (dom->max_vcpus - dom->online_vcpus) )
                 {
                     dom->online_vcpus = dom->max_vcpus - offline_vcpus;
-                    pool->hotplug_doms.insert({offline_vcpus, dom->dom_id});
+                    printf("Remove-vCPU: dom %u, max: %u online: %u\n", 
+                            dom->dom_id, dom->max_vcpus, dom->online_vcpus);
 
                     string cmd("/usr/local/sbin/xl vcpu-set ");
                     cmd += to_string((long long)dom->dom_id);
@@ -355,6 +382,12 @@ void check_all_domains(vbal_manager &vbal)
 
                     printf("exec: %s\n", cmd.c_str());
                     system(cmd.c_str());
+
+                    if ( pool->hotplug_doms_set.find(dom->dom_id) == pool->hotplug_doms_set.end() )
+                    {
+                        pool->hotplug_doms_set.insert(dom->dom_id);
+                        pool->hotplug_doms_rank.insert({offline_vcpus, dom->dom_id});
+                    }
                 }
                 else if ( offline_vcpus < (dom->max_vcpus - dom->online_vcpus) )
                 {
@@ -377,6 +410,7 @@ void check_all_domains(vbal_manager &vbal)
 
 void print_manager(vbal_manager &vbal)
 {
+    printf("===============================\n");
     printf("# of cpupools: %u\n", vbal.num_cpupools);
     for (auto pool_iter = vbal.all_cpupools.begin();
               pool_iter != vbal.all_cpupools.end(); 
@@ -407,8 +441,8 @@ void print_manager(vbal_manager &vbal)
                    );
         }
 
-        for (auto dom_iter = pool->hotplug_doms.begin();
-                  dom_iter != pool->hotplug_doms.end();
+        for (auto dom_iter = pool->hotplug_doms_rank.begin();
+                  dom_iter != pool->hotplug_doms_rank.end();
                   dom_iter++)
         {
             unsigned int dom_id = dom_iter->second;
@@ -436,10 +470,9 @@ int main(int argc, char* argv[])
         print_manager(global_manager);
 
         check_all_domains(global_manager);
+
         usleep(UPDATE_INTERVAL_SEC * USEC_PER_SEC);
     }
-
-    // system("/usr/local/sbin/xl vcpu-set 1 2");
 
     return 0;
 }
