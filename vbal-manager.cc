@@ -406,6 +406,17 @@ void print_manager(vbal_manager &vbal)
                     dom->cur_rt.offline_time, dom->prev_rt.offline_time
                    );
         }
+
+        for (auto dom_iter = pool->hotplug_doms.begin();
+                  dom_iter != pool->hotplug_doms.end();
+                  dom_iter++)
+        {
+            unsigned int dom_id = dom_iter->second;
+            printf("---offline_vcpus: %u, dom_id = %u, max = %u, online = %u\n",
+                   dom_iter->first, dom_id,
+                   pool->all_doms[dom_id].max_vcpus,
+                   pool->all_doms[dom_id].online_vcpus);
+        }
     }
 }
 
