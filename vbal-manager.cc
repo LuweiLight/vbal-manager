@@ -12,18 +12,30 @@
 using namespace std;
 
 typedef struct {
+    double running_time;
+    double runnnable_time;
+    double blocked_time;
+    double offline_time;
+} runtime_info;
+
+typedef struct {
     int dom_id;
-	int max_vcpus;
-	int online_vcpus;
-	double running_time;
-	double runnable_time;
-	double blocked_time;
-	double offline_time;
-	struct timeval last_check;
+
+    int weight;
+    int cap;
+
+    int max_vcpus;
+    int online_vcpus;
+
+    runtime_info prev;
+    runtime_info cur;
+
+    struct timeval last_check;
 } dom_info;
 
 
 typedef struct {
+    string name;
     int num_cpus;
     int num_doms;
     int total_weight;
@@ -70,6 +82,7 @@ void get_all_cpupools(vbal_manager &vbal)
         {
             cpupool_info new_cpupool;
             new_cpupool.num_cpus = num_cpus;
+            new_cpupool.name = pool_name;
             vbal.all_cpupools.insert({pool_name, new_cpupool});
         }
     }
@@ -77,56 +90,63 @@ void get_all_cpupools(vbal_manager &vbal)
     vbal.num_cpupools = num_cpupools;
 }
 
+void get_cpupool_domains(cpupool_info &cpupool)
+{
+    string cmd("/usr/local/sbin/xl sched-credit-cpupool -p ");
+    string cmd_p = cmd + cpupool.name;
+    char line[256];
+    int num_doms = 0;
+
+    FILE *pipe = popen(cmd_p.c_str(), "r");
+
+    fgets(line, sizeof(line), pipe);
+    fgets(line, sizeof(line), pipe);
+
+    char dom_name[256];
+    int dom_id;
+    int weight, cap;
+    int max_vcpus, online_vcpus;
+    double running_time, runnable_time, blocked_time, offline_time;
+
+    while (fgets(line, sizeof(line), pipe) != NULL)
+    {
+        num_doms++;
+        // printf("line = %s\n", line);
+        sscanf(line, "%s %d %d %d %d %d %lf %lf %lf %lf",
+                dom_name, &dom_id, &weight, &cap, &max_vcpus, &online_vcpus,
+                &running_time, &runnable_time, &blocked_time, &offline_time);
+        // printf("%s %d %d %d %d %d %lf %lf %lf %lf\n",
+        //        dom_name, dom_id, weight, cap, max_vcpus, online_vcpus,
+        //        running_time, runnable_time, blocked_time, offline_time);
+    }
+    
+    pclose(pipe);
+}
+
+void get_all_domains(vbal_manager &vbal)
+{
+    for (auto iter = vbal.all_cpupools.begin(); iter != vbal.all_cpupools.end(); iter++)
+    {
+        get_cpupool_domains(iter->second);
+    }
+}
+
 void print_manager(vbal_manager &vbal)
 {
-	printf("# of cpupools: %d\n", vbal.num_cpupools);
+    printf("# of cpupools: %d\n", vbal.num_cpupools);
     for (auto iter = vbal.all_cpupools.begin(); iter != vbal.all_cpupools.end(); iter++)
     {
         printf("%s: %d CPUs\n", iter->first.c_str(), iter->second.num_cpus);
     }
 }
 
-
-void get_cmd_output(void)
-{
-	char cmd[] = "/usr/local/sbin/xl list_cpu";
-	char line[256];
-	int num_dom = 0;
-
-	FILE *pipe = popen(cmd, "r");
-
-	// headline, ignore;
-	fgets(line, sizeof(line), pipe);
-
-	int dom_id;
-	int max_vcpus;
-	int online_vcpus;
-	double running_time, runnable_time, blocked_time, offline_time;
-
-	while (fgets(line, sizeof(line), pipe) != NULL) {
-		num_dom++;
-		printf("line = %s\n", line);
-
-		sscanf(line, "%d %d %d %lf %lf %lf %lf",
-                              &dom_id, &max_vcpus, &online_vcpus,
-                              &running_time, &runnable_time, &blocked_time, &offline_time);
-
-		printf("%d %d %d %lf %lf %lf %lf\n",
-			dom_id, max_vcpus, online_vcpus,
-			running_time, runnable_time, blocked_time, offline_time);
-	}
-
-	pclose(pipe);
-}
-
 int main(int argc, char* argv[])
 {
-	// get_cmd_output();
-
     init_manager(global_manager);
     get_all_cpupools(global_manager);
-    print_manager(global_manager);
+    get_all_domains(global_manager);
+    //print_manager(global_manager);
 
-	return 0;
+    return 0;
 }
 
