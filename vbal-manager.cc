@@ -163,6 +163,8 @@ void get_all_cpupools(vbal_manager &vbal)
     }
 
     vbal.num_cpupools = num_cpupools;
+
+    pclose(pipe);
 }
 
 void get_cpupool_domains(cpupool_info &pool)
@@ -463,7 +465,6 @@ void print_manager(vbal_manager &vbal)
         }
     }
 }
-
 
 int main(int argc, char* argv[])
 {
