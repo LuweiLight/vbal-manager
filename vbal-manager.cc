@@ -466,6 +466,33 @@ void print_manager(vbal_manager &vbal)
     }
 }
 
+/*
+ * The overhead of "xl list" (dom0 + 1 domU): 
+ * (a) when there is no IO
+ *   - on averate, 6.25ms per call
+ * Q: how about more domUs? linearly increase?
+ */
+static void
+benchmark_xl_cmd(void)
+{
+    char cmd[] = "/usr/local/sbin/xl list";
+    struct timeval start, end;
+    unsigned long long result;
+
+    gettimeofday(&start, NULL);
+    for ( int i = 0; i < 1000; i++)
+    {
+        FILE *pipe = popen(cmd, "r");
+        pclose(pipe);
+    }
+    gettimeofday(&end, NULL);
+
+    result = (end.tv_sec * 1000000 + end.tv_usec) -
+             (start.tv_sec * 1000000 + start.tv_usec);
+
+    printf("time spent: %llums\n", result/1000);
+}
+
 int main(int argc, char* argv[])
 {
     init_manager(global_manager);
@@ -484,6 +511,8 @@ int main(int argc, char* argv[])
 
         usleep(UPDATE_INTERVAL_SEC * USEC_PER_SEC);
     }
+
+    // benchmark_xl_cmd();
 
     return 0;
 }
